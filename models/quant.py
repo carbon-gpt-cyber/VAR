@@ -9,20 +9,36 @@ import dist
 
 
 # this file only provides the VectorQuantizer2 used in VQVAE
-__all__ = ['VectorQuantizer2',]
+__all__ = ['VectorQuantizer2', 'NextScalePredictor1D']
+
+
+class NextScalePredictor1D(nn.Module):
+    """Simple 1D conv predictor for sequence next-scale features."""
+
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.conv = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor, out_len: int) -> torch.Tensor:
+        x = F.interpolate(x, size=out_len, mode='linear')
+        return self.conv(x)
 
 
 class VectorQuantizer2(nn.Module):
     # VQGAN originally use beta=1.0, never tried 0.25; SD seems using 0.25
     def __init__(
         self, vocab_size, Cvae, using_znorm, beta: float = 0.25,
-        default_qresi_counts=0, v_patch_nums=None, quant_resi=0.5, share_quant_resi=4,  # share_quant_resi: args.qsr
+        default_qresi_counts=0, v_patch_nums=None, quant_resi=0.5, share_quant_resi=4,
+        is_seq: bool = False,
     ):
         super().__init__()
         self.vocab_size: int = vocab_size
         self.Cvae: int = Cvae
         self.using_znorm: bool = using_znorm
         self.v_patch_nums: Tuple[int] = v_patch_nums
+        self.is_seq = is_seq
+        self.patch_hws = [(1, pn) if is_seq else ((pn, pn) if isinstance(pn, int) else (pn[0], pn[1]))
+                          for pn in v_patch_nums]
         
         self.quant_resi_ratio = quant_resi
         if share_quant_resi == 0:   # non-shared: \phi_{1 to K} for K scales
@@ -32,11 +48,15 @@ class VectorQuantizer2(nn.Module):
         else:                       # partially shared: \phi_{1 to share_quant_resi} for K scales
             self.quant_resi = PhiPartiallyShared(nn.ModuleList([(Phi(Cvae, quant_resi) if abs(quant_resi) > 1e-6 else nn.Identity()) for _ in range(share_quant_resi)]))
         
-        self.register_buffer('ema_vocab_hit_SV', torch.full((len(self.v_patch_nums), self.vocab_size), fill_value=0.0))
+        self.register_buffer('ema_vocab_hit_SV', torch.full((len(self.patch_hws), self.vocab_size), fill_value=0.0))
         self.record_hit = 0
         
         self.beta: float = beta
         self.embedding = nn.Embedding(self.vocab_size, self.Cvae)
+        if self.is_seq:
+            self.next_scale_pred = NextScalePredictor1D(Cvae)
+        else:
+            self.next_scale_pred = None
         
         # only used for progressive training of VAR (not supported yet, will be tested and supported in the future)
         self.prog_si = -1   # progressive training: not supported yet, prog_si always -1
@@ -61,15 +81,15 @@ class VectorQuantizer2(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             mean_vq_loss: torch.Tensor = 0.0
             vocab_hit_V = torch.zeros(self.vocab_size, dtype=torch.float, device=f_BChw.device)
-            SN = len(self.v_patch_nums)
-            for si, pn in enumerate(self.v_patch_nums): # from small to large
+            SN = len(self.patch_hws)
+            for si, (ph, pw) in enumerate(self.patch_hws):
                 # find the nearest embedding
                 if self.using_znorm:
-                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
+                    rest_NC = F.interpolate(f_rest, size=(ph, pw), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
                     rest_NC = F.normalize(rest_NC, dim=-1)
                     idx_N = torch.argmax(rest_NC @ F.normalize(self.embedding.weight.data.T, dim=0), dim=1)
                 else:
-                    rest_NC = F.interpolate(f_rest, size=(pn, pn), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
+                    rest_NC = F.interpolate(f_rest, size=(ph, pw), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
                     d_no_grad = torch.sum(rest_NC.square(), dim=1, keepdim=True) + torch.sum(self.embedding.weight.data.square(), dim=1, keepdim=False)
                     d_no_grad.addmm_(rest_NC, self.embedding.weight.data.T, alpha=-2, beta=1)  # (B*h*w, vocab_size)
                     idx_N = torch.argmin(d_no_grad, dim=1)
@@ -79,8 +99,9 @@ class VectorQuantizer2(nn.Module):
                     if dist.initialized(): handler = tdist.all_reduce(hit_V, async_op=True)
                 
                 # calc loss
-                idx_Bhw = idx_N.view(B, pn, pn)
-                h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
+                idx_Bhw = idx_N.view(B, ph, pw)
+                up_mode = 'bilinear' if self.is_seq else 'bicubic'
+                h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode=up_mode).contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
                 h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
                 f_hat = f_hat + h_BChw
                 f_rest -= h_BChw
@@ -107,14 +128,15 @@ class VectorQuantizer2(nn.Module):
     def embed_to_fhat(self, ms_h_BChw: List[torch.Tensor], all_to_max_scale=True, last_one=False) -> Union[List[torch.Tensor], torch.Tensor]:
         ls_f_hat_BChw = []
         B = ms_h_BChw[0].shape[0]
-        H = W = self.v_patch_nums[-1]
-        SN = len(self.v_patch_nums)
+        H, W = self.patch_hws[-1]
+        SN = len(self.patch_hws)
         if all_to_max_scale:
             f_hat = ms_h_BChw[0].new_zeros(B, self.Cvae, H, W, dtype=torch.float32)
-            for si, pn in enumerate(self.v_patch_nums): # from small to large
+            up_mode = 'bilinear' if self.is_seq else 'bicubic'
+            for si, (ph, pw) in enumerate(self.patch_hws):
                 h_BChw = ms_h_BChw[si]
-                if si < len(self.v_patch_nums) - 1:
-                    h_BChw = F.interpolate(h_BChw, size=(H, W), mode='bicubic')
+                if si < len(self.patch_hws) - 1:
+                    h_BChw = F.interpolate(h_BChw, size=(H, W), mode=up_mode)
                 h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
                 f_hat.add_(h_BChw)
                 if last_one: ls_f_hat_BChw = f_hat
@@ -122,9 +144,10 @@ class VectorQuantizer2(nn.Module):
         else:
             # WARNING: this is not the case in VQ-VAE training or inference (we'll interpolate every token map to the max H W, like above)
             # WARNING: this should only be used for experimental purpose
-            f_hat = ms_h_BChw[0].new_zeros(B, self.Cvae, self.v_patch_nums[0], self.v_patch_nums[0], dtype=torch.float32)
-            for si, pn in enumerate(self.v_patch_nums): # from small to large
-                f_hat = F.interpolate(f_hat, size=(pn, pn), mode='bicubic')
+            f_hat = ms_h_BChw[0].new_zeros(B, self.Cvae, *self.patch_hws[0], dtype=torch.float32)
+            up_mode = 'bilinear' if self.is_seq else 'bicubic'
+            for si, (ph, pw) in enumerate(self.patch_hws):
+                f_hat = F.interpolate(f_hat, size=(ph, pw), mode=up_mode)
                 h_BChw = self.quant_resi[si/(SN-1)](ms_h_BChw[si])
                 f_hat.add_(h_BChw)
                 if last_one: ls_f_hat_BChw = f_hat
@@ -140,11 +163,15 @@ class VectorQuantizer2(nn.Module):
         
         f_hat_or_idx_Bl: List[torch.Tensor] = []
         
-        patch_hws = [(pn, pn) if isinstance(pn, int) else (pn[0], pn[1]) for pn in (v_patch_nums or self.v_patch_nums)]    # from small to large
+        patch_hws = [
+            (1, pn) if self.is_seq else ((pn, pn) if isinstance(pn, int) else (pn[0], pn[1]))
+            for pn in (v_patch_nums or self.v_patch_nums)
+        ]  # from small to large
         assert patch_hws[-1][0] == H and patch_hws[-1][1] == W, f'{patch_hws[-1]=} != ({H=}, {W=})'
         
         SN = len(patch_hws)
-        for si, (ph, pw) in enumerate(patch_hws): # from small to large
+        up_mode = 'bilinear' if self.is_seq else 'bicubic'
+        for si, (ph, pw) in enumerate(patch_hws):  # from small to large
             if 0 <= self.prog_si < si: break    # progressive training: not supported yet, prog_si always -1
             # find the nearest embedding
             z_NC = F.interpolate(f_rest, size=(ph, pw), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
@@ -157,7 +184,7 @@ class VectorQuantizer2(nn.Module):
                 idx_N = torch.argmin(d_no_grad, dim=1)
             
             idx_Bhw = idx_N.view(B, ph, pw)
-            h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
+            h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode=up_mode).contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
             h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
             f_hat.add_(h_BChw)
             f_rest.sub_(h_BChw)
@@ -170,26 +197,46 @@ class VectorQuantizer2(nn.Module):
         next_scales = []
         B = gt_ms_idx_Bl[0].shape[0]
         C = self.Cvae
-        H = W = self.v_patch_nums[-1]
-        SN = len(self.v_patch_nums)
+        H, W = self.patch_hws[-1]
+        SN = len(self.patch_hws)
         
         f_hat = gt_ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32)
-        pn_next: int = self.v_patch_nums[0]
+        ph_next, pw_next = self.patch_hws[0]
         for si in range(SN-1):
             if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break   # progressive training: not supported yet, prog_si always -1
-            h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn_next, pn_next), size=(H, W), mode='bicubic')
+            up_mode = 'linear' if self.is_seq else 'bicubic'
+            if self.is_seq:
+                h_seq = self.embedding(gt_ms_idx_Bl[si]).transpose(1, 2).view(B, C, pw_next)
+                h_seq = self.next_scale_pred(h_seq, W)
+                h_BChw = h_seq.unsqueeze(2)
+            else:
+                h_BChw = F.interpolate(
+                    self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, ph_next, pw_next),
+                    size=(H, W), mode=up_mode)
             f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
-            pn_next = self.v_patch_nums[si+1]
-            next_scales.append(F.interpolate(f_hat, size=(pn_next, pn_next), mode='area').view(B, C, -1).transpose(1, 2))
+            ph_next, pw_next = self.patch_hws[si+1]
+            if self.is_seq:
+                next_scales.append(F.interpolate(f_hat, size=pw_next, mode='area').view(B, C, -1).transpose(1, 2))
+            else:
+                next_scales.append(F.interpolate(f_hat, size=(ph_next, pw_next), mode='area').view(B, C, -1).transpose(1, 2))
         return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
     
     # ===================== get_next_autoregressive_input: only used in VAR inference, for getting next step's input =====================
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
-        HW = self.v_patch_nums[-1]
+        H, W = self.patch_hws[-1]
         if si != SN-1:
-            h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw, size=(HW, HW), mode='bicubic'))     # conv after upsample
+            up_mode = 'linear' if self.is_seq else 'bicubic'
+            if self.is_seq:
+                h_seq = self.next_scale_pred(h_BChw.squeeze(2), W)
+                h = self.quant_resi[si/(SN-1)](h_seq.unsqueeze(2))
+            else:
+                h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw, size=(H, W), mode=up_mode))
             f_hat.add_(h)
-            return f_hat, F.interpolate(f_hat, size=(self.v_patch_nums[si+1], self.v_patch_nums[si+1]), mode='area')
+            next_size = self.patch_hws[si+1]
+            if self.is_seq:
+                return f_hat, F.interpolate(f_hat, size=next_size[1], mode='area')
+            else:
+                return f_hat, F.interpolate(f_hat, size=next_size, mode='area')
         else:
             h = self.quant_resi[si/(SN-1)](h_BChw)
             f_hat.add_(h)
