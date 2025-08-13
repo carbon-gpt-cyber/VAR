@@ -122,6 +122,7 @@ You can load these models to generate images via the codes in [demo_sample.ipynb
 
 5. (Optional) install and compile `flash-attn` and `xformers` for faster attention computation. Our code will automatically use them if installed. See [models/basic_var.py#L15-L30](models/basic_var.py#L15-L30).
 
+6. To train on sequential data, pass `--is_seq` when building the VQ-VAE. This uses dedicated 1D encoder/decoder modules and a next-scale predictor tailored for sequences.
 
 ## Training Scripts
 
